@@ -1,8 +1,13 @@
 package torrent
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/anacrolix/missinggo/bitmap"
+	"github.com/anacrolix/missinggo/iter"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -16,4 +21,21 @@ func TestTorrentOffsetRequest(t *testing.T) {
 	check(13, 5, 3, newRequest(0, 0, 5), true)
 	check(13, 5, 11, newRequest(2, 0, 3), true)
 	check(13, 5, 13, request{}, false)
+}
+
+func TestIterBitmapsDistinct(t *testing.T) {
+	var skip, first, second bitmap.Bitmap
+	skip.Add(1)
+	first.Add(1, 0, 3)
+	second.Add(1, 2, 0)
+	skipCopy := skip.Copy()
+	assert.Equal(t, []interface{}{0, 3, 2}, iter.ToSlice(iterBitmapsDistinct(&skipCopy, first, second)))
+	assert.Equal(t, []int{1}, skip.ToSortedSlice())
+}
+
+func TestSpewConnStats(t *testing.T) {
+	s := spew.Sdump(ConnStats{})
+	t.Logf("\n%s", s)
+	lines := strings.Count(s, "\n")
+	assert.EqualValues(t, 2+reflect.ValueOf(ConnStats{}).NumField(), lines)
 }

@@ -1,28 +1,37 @@
 package storage
 
 import (
+	"sync"
+
 	"github.com/anacrolix/torrent/metainfo"
 )
 
 type mapPieceCompletion struct {
-	m map[metainfo.PieceKey]struct{}
+	mu sync.Mutex
+	m  map[metainfo.PieceKey]bool
 }
 
-func (mapPieceCompletion) Close() {}
+var _ PieceCompletion = (*mapPieceCompletion)(nil)
 
-func (me *mapPieceCompletion) Get(pk metainfo.PieceKey) (bool, error) {
-	_, ok := me.m[pk]
-	return ok, nil
+func NewMapPieceCompletion() PieceCompletion {
+	return &mapPieceCompletion{m: make(map[metainfo.PieceKey]bool)}
+}
+
+func (*mapPieceCompletion) Close() error { return nil }
+
+func (me *mapPieceCompletion) Get(pk metainfo.PieceKey) (c Completion, err error) {
+	me.mu.Lock()
+	defer me.mu.Unlock()
+	c.Complete, c.Ok = me.m[pk]
+	return
 }
 
 func (me *mapPieceCompletion) Set(pk metainfo.PieceKey, b bool) error {
-	if b {
-		if me.m == nil {
-			me.m = make(map[metainfo.PieceKey]struct{})
-		}
-		me.m[pk] = struct{}{}
-	} else {
-		delete(me.m, pk)
+	me.mu.Lock()
+	defer me.mu.Unlock()
+	if me.m == nil {
+		me.m = make(map[metainfo.PieceKey]bool)
 	}
+	me.m[pk] = b
 	return nil
 }

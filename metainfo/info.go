@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,12 +14,14 @@ import (
 
 // The info dictionary.
 type Info struct {
-	PieceLength int64      `bencode:"piece length"`
-	Pieces      []byte     `bencode:"pieces"`
-	Name        string     `bencode:"name"`
-	Length      int64      `bencode:"length,omitempty"`
-	Private     *bool      `bencode:"private,omitempty"`
-	Files       []FileInfo `bencode:"files,omitempty"`
+	PieceLength int64  `bencode:"piece length"`
+	Pieces      []byte `bencode:"pieces"`
+	Name        string `bencode:"name"`
+	Length      int64  `bencode:"length,omitempty"`
+	Private     *bool  `bencode:"private,omitempty"`
+	// TODO: Document this field.
+	Source string     `bencode:"source,omitempty"`
+	Files  []FileInfo `bencode:"files,omitempty"`
 }
 
 // This is a helper that sets Files and Pieces from a root path and its
@@ -41,7 +42,6 @@ func (info *Info) BuildFromFilePath(root string) (err error) {
 			return nil
 		}
 		relPath, err := filepath.Rel(root, path)
-		log.Println(relPath, err)
 		if err != nil {
 			return fmt.Errorf("error getting relative path: %s", err)
 		}
@@ -66,6 +66,8 @@ func (info *Info) BuildFromFilePath(root string) (err error) {
 	return
 }
 
+// Concatenates all the files in the torrent into w. open is a function that
+// gets at the contents of the given file.
 func (info *Info) writeFiles(w io.Writer, open func(fi FileInfo) (io.ReadCloser, error)) error {
 	for _, fi := range info.UpvertedFiles() {
 		r, err := open(fi)
@@ -74,14 +76,15 @@ func (info *Info) writeFiles(w io.Writer, open func(fi FileInfo) (io.ReadCloser,
 		}
 		wn, err := io.CopyN(w, r, fi.Length)
 		r.Close()
-		if wn != fi.Length || err != nil {
-			return fmt.Errorf("error hashing %v: %s", fi, err)
+		if wn != fi.Length {
+			return fmt.Errorf("error copying %v: %s", fi, err)
 		}
 	}
 	return nil
 }
 
-// Set info.Pieces by hashing info.Files.
+// Sets Pieces (the block of piece hashes in the Info) by using the passed
+// function to get at the torrent data.
 func (info *Info) GeneratePieces(open func(fi FileInfo) (io.ReadCloser, error)) error {
 	if info.PieceLength == 0 {
 		return errors.New("piece length must be non-zero")
@@ -126,9 +129,6 @@ func (info *Info) TotalLength() (ret int64) {
 }
 
 func (info *Info) NumPieces() int {
-	if len(info.Pieces)%20 != 0 {
-		panic(len(info.Pieces))
-	}
 	return len(info.Pieces) / 20
 }
 
@@ -152,5 +152,5 @@ func (info *Info) UpvertedFiles() []FileInfo {
 }
 
 func (info *Info) Piece(index int) Piece {
-	return Piece{info, index}
+	return Piece{info, pieceIndex(index)}
 }

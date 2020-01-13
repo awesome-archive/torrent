@@ -1,6 +1,8 @@
 package torrent
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,12 +13,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anacrolix/torrent/bencode"
+	"github.com/anacrolix/torrent/internal/testutil"
 	"github.com/anacrolix/torrent/metainfo"
-	"github.com/anacrolix/torrent/peer_protocol"
+	pp "github.com/anacrolix/torrent/peer_protocol"
 	"github.com/anacrolix/torrent/storage"
 )
 
-func r(i, b, l peer_protocol.Integer) request {
+func r(i, b, l pp.Integer) request {
 	return request{i, chunkSpec{b, l}}
 }
 
@@ -73,13 +76,18 @@ func TestTorrentString(t *testing.T) {
 // a large torrent with small pieces had a lot of overhead in recalculating
 // piece priorities everytime a reader (possibly in another Torrent) changed.
 func BenchmarkUpdatePiecePriorities(b *testing.B) {
-	cl := &Client{}
-	t := cl.newTorrent(metainfo.Hash{})
-	t.info = &metainfo.Info{
-		Pieces:      make([]byte, 20*13410),
-		PieceLength: 256 << 10,
-	}
-	t.makePieces()
+	const (
+		numPieces   = 13410
+		pieceLength = 256 << 10
+	)
+	cl := &Client{config: &ClientConfig{}}
+	cl.initLogger()
+	t := cl.newTorrent(metainfo.Hash{}, nil)
+	require.NoError(b, t.setInfo(&metainfo.Info{
+		Pieces:      make([]byte, metainfo.HashSize*numPieces),
+		PieceLength: pieceLength,
+		Length:      pieceLength * numPieces,
+	}))
 	assert.EqualValues(b, 13410, t.numPieces())
 	for range iter.N(7) {
 		r := t.NewReader()
@@ -87,22 +95,20 @@ func BenchmarkUpdatePiecePriorities(b *testing.B) {
 		r.Seek(3500000, 0)
 	}
 	assert.Len(b, t.readers, 7)
-	t.pendPieceRange(0, t.numPieces())
-	for i := 0; i < t.numPieces(); i += 3 {
+	for i := 0; i < int(t.numPieces()); i += 3 {
 		t.completedPieces.Set(i, true)
 	}
+	t.DownloadPieces(0, t.numPieces())
 	for range iter.N(b.N) {
-		t.updatePiecePriorities()
+		t.updateAllPiecePriorities()
 	}
 }
 
 // Check that a torrent containing zero-length file(s) will start, and that
 // they're created in the filesystem. The client storage is assumed to be
 // file-based on the native filesystem based.
-func testEmptyFilesAndZeroPieceLength(t *testing.T, cs storage.ClientImpl) {
-	cfg := TestingConfig
-	cfg.DefaultStorage = cs
-	cl, err := NewClient(&TestingConfig)
+func testEmptyFilesAndZeroPieceLength(t *testing.T, cfg *ClientConfig) {
+	cl, err := NewClient(cfg)
 	require.NoError(t, err)
 	defer cl.Close()
 	ib, err := bencode.Marshal(metainfo.Info{
@@ -111,7 +117,7 @@ func testEmptyFilesAndZeroPieceLength(t *testing.T, cs storage.ClientImpl) {
 		PieceLength: 0,
 	})
 	require.NoError(t, err)
-	fp := filepath.Join(TestingConfig.DataDir, "empty")
+	fp := filepath.Join(cfg.DataDir, "empty")
 	os.Remove(fp)
 	assert.False(t, missinggo.FilePathExists(fp))
 	tt, err := cl.AddTorrent(&metainfo.MetaInfo{
@@ -125,9 +131,90 @@ func testEmptyFilesAndZeroPieceLength(t *testing.T, cs storage.ClientImpl) {
 }
 
 func TestEmptyFilesAndZeroPieceLengthWithFileStorage(t *testing.T) {
-	testEmptyFilesAndZeroPieceLength(t, storage.NewFile(TestingConfig.DataDir))
+	cfg := TestingConfig()
+	ci := storage.NewFile(cfg.DataDir)
+	defer ci.Close()
+	cfg.DefaultStorage = ci
+	testEmptyFilesAndZeroPieceLength(t, cfg)
 }
 
 func TestEmptyFilesAndZeroPieceLengthWithMMapStorage(t *testing.T) {
-	testEmptyFilesAndZeroPieceLength(t, storage.NewMMap(TestingConfig.DataDir))
+	cfg := TestingConfig()
+	ci := storage.NewMMap(cfg.DataDir)
+	defer ci.Close()
+	cfg.DefaultStorage = ci
+	testEmptyFilesAndZeroPieceLength(t, cfg)
+}
+
+func TestPieceHashFailed(t *testing.T) {
+	mi := testutil.GreetingMetaInfo()
+	cl := new(Client)
+	cl.config = TestingConfig()
+	cl.initLogger()
+	tt := cl.newTorrent(mi.HashInfoBytes(), badStorage{})
+	tt.setChunkSize(2)
+	require.NoError(t, tt.setInfoBytes(mi.InfoBytes))
+	tt.cl.lock()
+	tt.pieces[1].dirtyChunks.AddRange(0, 3)
+	require.True(t, tt.pieceAllDirty(1))
+	tt.pieceHashed(1, false)
+	// Dirty chunks should be cleared so we can try again.
+	require.False(t, tt.pieceAllDirty(1))
+	tt.cl.unlock()
+}
+
+// Check the behaviour of Torrent.Metainfo when metadata is not completed.
+func TestTorrentMetainfoIncompleteMetadata(t *testing.T) {
+	cfg := TestingConfig()
+	cfg.Debug = true
+	cl, err := NewClient(cfg)
+	require.NoError(t, err)
+	defer cl.Close()
+
+	mi := testutil.GreetingMetaInfo()
+	ih := mi.HashInfoBytes()
+
+	tt, _ := cl.AddTorrentInfoHash(ih)
+	assert.Nil(t, tt.Metainfo().InfoBytes)
+	assert.False(t, tt.haveAllMetadataPieces())
+
+	nc, err := net.Dial("tcp", fmt.Sprintf(":%d", cl.LocalPort()))
+	require.NoError(t, err)
+	defer nc.Close()
+
+	var pex PeerExtensionBits
+	pex.SetBit(pp.ExtensionBitExtended)
+	hr, err := pp.Handshake(nc, &ih, [20]byte{}, pex)
+	require.NoError(t, err)
+	assert.True(t, hr.PeerExtensionBits.GetBit(pp.ExtensionBitExtended))
+	assert.EqualValues(t, cl.PeerID(), hr.PeerID)
+	assert.EqualValues(t, ih, hr.Hash)
+
+	assert.EqualValues(t, 0, tt.metadataSize())
+
+	func() {
+		cl.lock()
+		defer cl.unlock()
+		go func() {
+			_, err = nc.Write(pp.Message{
+				Type:       pp.Extended,
+				ExtendedID: pp.HandshakeExtendedID,
+				ExtendedPayload: func() []byte {
+					d := map[string]interface{}{
+						"metadata_size": len(mi.InfoBytes),
+					}
+					b, err := bencode.Marshal(d)
+					if err != nil {
+						panic(err)
+					}
+					return b
+				}(),
+			}.MustMarshalBinary())
+			require.NoError(t, err)
+		}()
+		tt.metadataChanged.Wait()
+	}()
+	assert.Equal(t, make([]byte, len(mi.InfoBytes)), tt.metadataBytes)
+	assert.False(t, tt.haveAllMetadataPieces())
+	assert.Nil(t, tt.Metainfo().InfoBytes)
 }

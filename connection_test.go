@@ -1,81 +1,40 @@
 package torrent
 
 import (
-	"container/list"
 	"io"
-	"io/ioutil"
 	"net"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/anacrolix/missinggo/pubsub"
 	"github.com/bradfitz/iter"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anacrolix/torrent/metainfo"
-	"github.com/anacrolix/torrent/peer_protocol"
+	pp "github.com/anacrolix/torrent/peer_protocol"
 	"github.com/anacrolix/torrent/storage"
 )
-
-func TestCancelRequestOptimized(t *testing.T) {
-	r, w := io.Pipe()
-	c := &connection{
-		PeerMaxRequests: 1,
-		peerPieces: func() bitmap.Bitmap {
-			var bm bitmap.Bitmap
-			bm.Set(1, true)
-			return bm
-		}(),
-		w:    w,
-		conn: new(net.TCPConn),
-		// For the locks
-		t: &Torrent{cl: &Client{}},
-	}
-	assert.Len(t, c.Requests, 0)
-	c.Request(newRequest(1, 2, 3))
-	require.Len(t, c.Requests, 1)
-	// Posting this message should removing the pending Request.
-	require.True(t, c.Cancel(newRequest(1, 2, 3)))
-	assert.Len(t, c.Requests, 0)
-	// Check that write optimization filters out the Request, due to the
-	// Cancel. We should have received an Interested, due to the initial
-	// request, and then keep-alives until we close the connection.
-	go c.writer(0)
-	b := make([]byte, 9)
-	n, err := io.ReadFull(r, b)
-	require.NoError(t, err)
-	require.EqualValues(t, len(b), n)
-	require.EqualValues(t, "\x00\x00\x00\x01\x02"+"\x00\x00\x00\x00", string(b))
-	time.Sleep(time.Millisecond)
-	c.mu().Lock()
-	c.Close()
-	c.mu().Unlock()
-	w.Close()
-	b, err = ioutil.ReadAll(r)
-	require.NoError(t, err)
-	// A single keep-alive will have gone through, as writer would be stuck
-	// trying to flush it, and then promptly close.
-	require.EqualValues(t, "\x00\x00\x00\x00", string(b))
-}
 
 // Ensure that no race exists between sending a bitfield, and a subsequent
 // Have that would potentially alter it.
 func TestSendBitfieldThenHave(t *testing.T) {
-	r, w := io.Pipe()
-	c := &connection{
-		t: &Torrent{
-			cl: &Client{},
-		},
-		r: r,
-		w: w,
-		outgoingUnbufferedMessages: list.New(),
+	cl := Client{
+		config: TestingConfig(),
 	}
+	cl.initLogger()
+	c := cl.newConnection(nil, false, IpPort{}, "")
+	c.setTorrent(cl.newTorrent(metainfo.Hash{}, nil))
+	c.t.setInfo(&metainfo.Info{
+		Pieces: make([]byte, metainfo.HashSize*3),
+	})
+	r, w := io.Pipe()
+	c.r = r
+	c.w = w
 	go c.writer(time.Minute)
 	c.mu().Lock()
-	c.Bitfield([]bool{false, true, false})
+	c.t.completedPieces.Add(1)
+	c.PostBitfield( /*[]bool{false, true, false}*/ )
 	c.mu().Unlock()
 	c.mu().Lock()
 	c.Have(2)
@@ -103,8 +62,8 @@ func (me *torrentStorage) Piece(mp metainfo.Piece) storage.PieceImpl {
 	return me
 }
 
-func (me *torrentStorage) GetIsComplete() bool {
-	return false
+func (me *torrentStorage) Completion() storage.Completion {
+	return storage.Completion{}
 }
 
 func (me *torrentStorage) MarkComplete() error {
@@ -128,53 +87,59 @@ func (me *torrentStorage) WriteAt(b []byte, _ int64) (int, error) {
 }
 
 func BenchmarkConnectionMainReadLoop(b *testing.B) {
-	cl := &Client{}
+	cl := &Client{
+		config: &ClientConfig{
+			DownloadRateLimiter: unlimited,
+		},
+	}
+	cl.initLogger()
 	ts := &torrentStorage{}
 	t := &Torrent{
-		cl: cl,
-		info: &metainfo.Info{
-			Pieces:      make([]byte, 20),
-			Length:      1 << 20,
-			PieceLength: 1 << 20,
-		},
+		cl:                cl,
 		storage:           &storage.Torrent{ts},
 		pieceStateChanges: pubsub.NewPubSub(),
 	}
+	require.NoError(b, t.setInfo(&metainfo.Info{
+		Pieces:      make([]byte, 20),
+		Length:      1 << 20,
+		PieceLength: 1 << 20,
+	}))
 	t.setChunkSize(defaultChunkSize)
-	t.makePieces()
-	t.pendingPieces.Add(0)
-	r, w := io.Pipe()
-	cn := &connection{
-		t: t,
-		r: r,
-	}
+	t.pendingPieces.Set(0, PiecePriorityNormal.BitmapPriority())
+	r, w := net.Pipe()
+	cn := cl.newConnection(r, true, IpPort{}, "")
+	cn.setTorrent(t)
 	mrlErr := make(chan error)
-	cl.mu.Lock()
+	msg := pp.Message{
+		Type:  pp.Piece,
+		Piece: make([]byte, defaultChunkSize),
+	}
 	go func() {
+		cl.lock()
 		err := cn.mainReadLoop()
 		if err != nil {
 			mrlErr <- err
 		}
 		close(mrlErr)
 	}()
-	msg := peer_protocol.Message{
-		Type:  peer_protocol.Piece,
-		Piece: make([]byte, defaultChunkSize),
-	}
-	wb, err := msg.MarshalBinary()
-	require.NoError(b, err)
+	wb := msg.MustMarshalBinary()
 	b.SetBytes(int64(len(msg.Piece)))
-	ts.writeSem.Lock()
-	for range iter.N(b.N) {
-		cl.mu.Lock()
-		t.pieces[0].DirtyChunks.Clear()
-		cl.mu.Unlock()
-		n, err := w.Write(wb)
-		require.NoError(b, err)
-		require.EqualValues(b, len(wb), n)
+	go func() {
+		defer w.Close()
 		ts.writeSem.Lock()
-	}
-	w.Close()
+		for range iter.N(b.N) {
+			cl.lock()
+			// The chunk must be written to storage everytime, to ensure the
+			// writeSem is unlocked.
+			t.pieces[0].dirtyChunks.Clear()
+			cn.validReceiveChunks = map[request]struct{}{newRequestFromMessage(&msg): {}}
+			cl.unlock()
+			n, err := w.Write(wb)
+			require.NoError(b, err)
+			require.EqualValues(b, len(wb), n)
+			ts.writeSem.Lock()
+		}
+	}()
 	require.NoError(b, <-mrlErr)
-	require.EqualValues(b, b.N, cn.UsefulChunksReceived)
+	require.EqualValues(b, b.N, cn.stats.ChunksReadUseful.Int64())
 }

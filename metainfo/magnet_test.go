@@ -2,11 +2,10 @@ package metainfo
 
 import (
 	"encoding/hex"
-	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/davecgh/go-spew/spew"
+	qt "github.com/go-quicktest/qt"
 )
 
 var (
@@ -20,13 +19,15 @@ var (
 	}
 )
 
+func init() {
+	hex.Decode(exampleMagnet.InfoHash[:], []byte("51340689c960f0778a4387aef9b4b52fd08390cd"))
+}
+
 // Converting from our Magnet type to URL string.
 func TestMagnetString(t *testing.T) {
-	hex.Decode(exampleMagnet.InfoHash[:], []byte("51340689c960f0778a4387aef9b4b52fd08390cd"))
-	s := exampleMagnet.String()
-	if s != exampleMagnetURI {
-		t.Fatalf("\nexpected:\n\t%q\nactual\n\t%q", exampleMagnetURI, s)
-	}
+	m, err := ParseMagnetUri(exampleMagnet.String())
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.DeepEquals(m, exampleMagnet))
 }
 
 func TestParseMagnetURI(t *testing.T) {
@@ -36,19 +37,18 @@ func TestParseMagnetURI(t *testing.T) {
 
 	// parsing the legit Magnet URI with btih-formatted xt should not return errors
 	uri = "magnet:?xt=urn:btih:ZOCMZQIPFFW7OLLMIC5HUB6BPCSDEOQU"
-	_, err = ParseMagnetURI(uri)
+	_, err = ParseMagnetUri(uri)
 	if err != nil {
 		t.Errorf("Attempting parsing the proper Magnet btih URI:\"%v\" failed with err: %v", uri, err)
 	}
 
 	// Checking if the magnet instance struct is built correctly from parsing
-	m, err = ParseMagnetURI(exampleMagnetURI)
-	if err != nil || !reflect.DeepEqual(exampleMagnet, m) {
-		t.Errorf("ParseMagnetURI(%s) returned %v, expected %v", uri, m, exampleMagnet)
-	}
+	m, err = ParseMagnetUri(exampleMagnetURI)
+	qt.Check(t, qt.DeepEquals(m, exampleMagnet))
+	qt.Check(t, qt.IsNil(err))
 
 	// empty string URI case
-	_, err = ParseMagnetURI("")
+	_, err = ParseMagnetUri("")
 	if err == nil {
 		t.Errorf("Parsing empty string as URI should have returned an error but didn't")
 	}
@@ -56,29 +56,28 @@ func TestParseMagnetURI(t *testing.T) {
 	// only BTIH (BitTorrent info hash)-formatted magnet links are currently supported
 	// must return error correctly when encountering other URN formats
 	uri = "magnet:?xt=urn:sha1:YNCKHTQCWBTRNJIV4WNAE52SJUQCZO5C"
-	_, err = ParseMagnetURI(uri)
+	_, err = ParseMagnetUri(uri)
 	if err == nil {
 		t.Errorf("Magnet URI with non-BTIH URNs (like \"%v\") are not supported and should return an error", uri)
 	}
 
 	// resilience to the broken hash
 	uri = "magnet:?xt=urn:btih:this hash is really broken"
-	_, err = ParseMagnetURI(uri)
+	_, err = ParseMagnetUri(uri)
 	if err == nil {
 		t.Errorf("Failed to detect broken Magnet URI: %v", uri)
 	}
-
 }
 
 func TestMagnetize(t *testing.T) {
 	mi, err := LoadFromFile("../testdata/bootstrap.dat.torrent")
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 
 	info, err := mi.UnmarshalInfo()
-	require.NoError(t, err)
-	m := mi.Magnet(info.Name, mi.HashInfoBytes())
+	qt.Assert(t, qt.IsNil(err))
+	m := mi.Magnet(nil, &info)
 
-	assert.EqualValues(t, "bootstrap.dat", m.DisplayName)
+	qt.Check(t, qt.Equals(m.DisplayName, "bootstrap.dat"))
 
 	ih := [20]byte{
 		54, 113, 155, 162, 206, 207, 159, 59, 215, 197,
@@ -112,4 +111,22 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// Check that we can parse the magnet link generated from a real-world torrent. This was added due
+// to a regression in copyParams.
+func TestParseSintelMagnet(t *testing.T) {
+	mi, err := LoadFromFile("../testdata/sintel.torrent")
+	qt.Assert(t, qt.IsNil(err))
+	m := mi.Magnet(nil, nil)
+	ms := m.String()
+	t.Logf("magnet link: %q", ms)
+	m, err = ParseMagnetUri(ms)
+	qt.Check(t, qt.IsNil(err))
+	spewCfg := spew.NewDefaultConfig()
+	spewCfg.DisableMethods = true
+	spewCfg.Dump(m)
+	m2, err := ParseMagnetV2Uri(ms)
+	spewCfg.Dump(m2)
+	qt.Check(t, qt.IsNil(err))
 }

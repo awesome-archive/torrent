@@ -1,21 +1,15 @@
 package dirwatch
 
 import (
-	"io/ioutil"
-	"os"
 	"testing"
+
+	qt "github.com/go-quicktest/qt"
 )
 
 func TestDirwatch(t *testing.T) {
-	tempDirName, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDirName)
+	tempDirName := t.TempDir()
 	t.Logf("tempdir: %q", tempDirName)
 	dw, err := New(tempDirName)
+	qt.Assert(t, qt.IsNil(err))
 	defer dw.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
 }

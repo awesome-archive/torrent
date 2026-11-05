@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	qt "github.com/go-quicktest/qt"
 )
 
 func TestBinaryReadSliceOfPointers(t *testing.T) {
@@ -25,10 +27,8 @@ func TestBinaryReadSliceOfPointers(t *testing.T) {
 }
 
 func TestConstants(t *testing.T) {
-	// check that iota works as expected in the const block
-	if NotInterested != 3 {
-		t.FailNow()
-	}
+	qt.Check(t, qt.Equals(NotInterested, 3))
+	qt.Check(t, qt.Equals(HaveAll, 14))
 }
 
 func TestBitfieldEncode(t *testing.T) {
@@ -82,7 +82,7 @@ func TestShortRead(t *testing.T) {
 	}
 	msg := new(Message)
 	err := dec.Decode(msg)
-	if !strings.Contains(err.Error(), "1 bytes unused in message type 0") {
+	if !strings.Contains(err.Error(), "1 unused bytes in message type Choke") {
 		t.Fatal(err)
 	}
 }

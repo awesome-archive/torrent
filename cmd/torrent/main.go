@@ -2,168 +2,152 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
-	"log"
-	"net"
+	"io"
+	stdLog "log"
+	"log/slog"
 	"net/http"
 	"os"
-	"strings"
-	"time"
 
-	_ "github.com/anacrolix/envpprof"
-	"github.com/anacrolix/tagflag"
-	"github.com/dustin/go-humanize"
-	"github.com/gosuri/uiprogress"
-	"golang.org/x/time/rate"
+	"github.com/anacrolix/bargle"
+	"github.com/anacrolix/envpprof"
+	app "github.com/anacrolix/gostdapp"
+	"github.com/anacrolix/log"
+	expvar_prometheus "github.com/anacrolix/missinggo/v2/expvar-prometheus"
 
-	"github.com/anacrolix/torrent"
-	"github.com/anacrolix/torrent/metainfo"
-	"github.com/anacrolix/torrent/storage"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/anacrolix/torrent/bencode"
+	"github.com/anacrolix/torrent/version"
 )
 
-func resolvedPeerAddrs(ss []string) (ret []torrent.Peer, err error) {
-	for _, s := range ss {
-		var addr *net.TCPAddr
-		addr, err = net.ResolveTCPAddr("tcp", s)
-		if err != nil {
-			return
-		}
-		ret = append(ret, torrent.Peer{
-			IP:   addr.IP,
-			Port: addr.Port,
-		})
-	}
-	return
-}
-
-func torrentBar(t *torrent.Torrent) {
-	bar := uiprogress.AddBar(1)
-	bar.AppendCompleted()
-	bar.AppendFunc(func(*uiprogress.Bar) (ret string) {
-		select {
-		case <-t.GotInfo():
-		default:
-			return "getting info"
-		}
-		if t.Seeding() {
-			return "seeding"
-		} else if t.BytesCompleted() == t.Info().TotalLength() {
-			return "completed"
-		} else {
-			return fmt.Sprintf("downloading (%s/%s)", humanize.Bytes(uint64(t.BytesCompleted())), humanize.Bytes(uint64(t.Info().TotalLength())))
-		}
-	})
-	bar.PrependFunc(func(*uiprogress.Bar) string {
-		return t.Name()
-	})
-	go func() {
-		<-t.GotInfo()
-		tl := int(t.Info().TotalLength())
-		if tl == 0 {
-			bar.Set(1)
-			return
-		}
-		bar.Total = tl
-		for {
-			bc := t.BytesCompleted()
-			bar.Set(int(bc))
-			time.Sleep(time.Second)
-		}
-	}()
-}
-
-func addTorrents(client *torrent.Client) {
-	for _, arg := range flags.Torrent {
-		t := func() *torrent.Torrent {
-			if strings.HasPrefix(arg, "magnet:") {
-				t, err := client.AddMagnet(arg)
-				if err != nil {
-					log.Fatalf("error adding magnet: %s", err)
-				}
-				return t
-			} else {
-				metaInfo, err := metainfo.LoadFromFile(arg)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "error loading torrent file %q: %s\n", arg, err)
-					os.Exit(1)
-				}
-				t, err := client.AddTorrent(metaInfo)
-				if err != nil {
-					log.Fatal(err)
-				}
-				return t
-			}
-		}()
-		torrentBar(t)
-		t.AddPeers(func() (ret []torrent.Peer) {
-			for _, ta := range flags.TestPeer {
-				ret = append(ret, torrent.Peer{
-					IP:   ta.IP,
-					Port: ta.Port,
-				})
-			}
-			return
-		}())
-		go func() {
-			<-t.GotInfo()
-			t.DownloadAll()
-		}()
-	}
-}
-
-var flags = struct {
-	Mmap         bool           `help:"memory-map torrent data"`
-	TestPeer     []*net.TCPAddr `help:"addresses of some starting peers"`
-	Seed         bool           `help:"seed after download is complete"`
-	Addr         *net.TCPAddr   `help:"network listen addr"`
-	UploadRate   tagflag.Bytes  `help:"max piece bytes to send per second"`
-	DownloadRate tagflag.Bytes  `help:"max bytes per second down from peers"`
-	tagflag.StartPos
-	Torrent []string `arity:"+" help:"torrent file path or magnet uri"`
-}{
-	UploadRate:   -1,
-	DownloadRate: -1,
+func init() {
+	stdLog.SetFlags(stdLog.Flags() | stdLog.Lshortfile)
+	prometheus.MustRegister(expvar_prometheus.NewCollector())
+	http.Handle("/metrics", promhttp.Handler())
+	log.Default = log.NewLogger().WithDefaultLevel(log.Info)
+	log.Default.SetHandlers(log.SlogHandlerAsHandler{SlogHandler: slog.Default().Handler()})
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	tagflag.Parse(&flags)
-	var clientConfig torrent.Config
-	if flags.Mmap {
-		clientConfig.DefaultStorage = storage.NewMMap("")
-	}
-	if flags.Addr != nil {
-		clientConfig.ListenAddr = flags.Addr.String()
-	}
-	if flags.Seed {
-		clientConfig.Seed = true
-	}
-	if flags.UploadRate != -1 {
-		clientConfig.UploadRateLimiter = rate.NewLimiter(rate.Limit(flags.UploadRate), 256<<10)
-	}
-	if flags.DownloadRate != -1 {
-		clientConfig.DownloadRateLimiter = rate.NewLimiter(rate.Limit(flags.DownloadRate), 1<<20)
-	}
+	app.RunContext(mainErr)
+}
 
-	client, err := torrent.NewClient(&clientConfig)
-	if err != nil {
-		log.Fatalf("error creating client: %s", err)
+func mainErr(ctx context.Context) error {
+	main := bargle.Main{}
+	main.Defer(envpprof.Stop)
+	debug := false
+	debugFlag := bargle.NewFlag(&debug)
+	debugFlag.AddLong("debug")
+	main.Options = append(main.Options, debugFlag.Make())
+	main.AfterParseFunc = func(ctx bargle.Context) error {
+		if debug {
+			slog.SetLogLoggerLevel(slog.LevelDebug)
+		}
+		return nil
 	}
-	defer client.Close()
-	// Write status on the root path on the default HTTP muxer. This will be
-	// bound to localhost somewhere if GOPPROF is set, thanks to the envpprof
-	// import.
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		client.WriteStatus(w)
-	})
-	uiprogress.Start()
-	addTorrents(client)
-	if client.WaitAll() {
-		log.Print("downloaded ALL the torrents")
-	} else {
-		log.Fatal("y u no complete torrents?!")
-	}
-	if flags.Seed {
-		select {}
-	}
+	main.Positionals = append(main.Positionals,
+		bargle.Subcommand{Name: "metainfo", Command: metainfoCmd()},
+		bargle.Subcommand{Name: "announce", Command: func() bargle.Command {
+			var ac AnnounceCmd
+			cmd := bargle.FromStruct(&ac)
+			cmd.DefaultAction = func() error {
+				return announceErr(ac)
+			}
+			return cmd
+		}()},
+		bargle.Subcommand{Name: "scrape", Command: func() bargle.Command {
+			var scrapeCfg scrapeCfg
+			cmd := bargle.FromStruct(&scrapeCfg)
+			cmd.Desc = "fetch swarm metrics for info-hashes from tracker"
+			cmd.DefaultAction = func() error {
+				return scrape(scrapeCfg)
+			}
+			return cmd
+		}()},
+		bargle.Subcommand{Name: "download", Command: func() bargle.Command {
+			var dlc DownloadCmd
+			cmd := bargle.FromStruct(&dlc)
+			cmd.DefaultAction = func() error {
+				return downloadErr(
+					ctx,
+					downloadFlags{
+						Debug:       debug,
+						DownloadCmd: dlc,
+					},
+					slog.Default(),
+				)
+			}
+			return cmd
+		}()},
+		bargle.Subcommand{
+			Name: "bencode",
+			Command: func() (cmd bargle.Command) {
+				var print func(interface{}) error
+				cmd.Positionals = append(cmd.Positionals,
+					bargle.Subcommand{Name: "json", Command: func() (cmd bargle.Command) {
+						cmd.DefaultAction = func() error {
+							je := json.NewEncoder(os.Stdout)
+							je.SetIndent("", "  ")
+							print = je.Encode
+							return nil
+						}
+						return
+					}()},
+					bargle.Subcommand{Name: "spew", Command: func() (cmd bargle.Command) {
+						cmd.DefaultAction = func() error {
+							config := spew.NewDefaultConfig()
+							config.DisableCapacities = true
+							config.Indent = "  "
+							print = func(v interface{}) error {
+								config.Dump(v)
+								return nil
+							}
+							return nil
+						}
+						return
+					}()})
+				d := bencode.NewDecoder(os.Stdin)
+				cmd.AfterParseFunc = func(ctx bargle.Context) error {
+					ctx.AfterParse(func() error {
+						for i := 0; ; i++ {
+							var v interface{}
+							err := d.Decode(&v)
+							if err == io.EOF {
+								break
+							}
+							if err != nil {
+								return fmt.Errorf("decoding message index %d: %w", i, err)
+							}
+							print(v)
+						}
+						return nil
+					})
+					return nil
+				}
+				cmd.Desc = "reads bencoding from stdin into Go native types and spews the result"
+				return
+			}(),
+		},
+		bargle.Subcommand{Name: "version", Command: bargle.Command{
+			DefaultAction: func() error {
+				fmt.Printf("HTTP User-Agent: %q\n", version.DefaultHttpUserAgent)
+				fmt.Printf("Torrent client version: %q\n", version.DefaultExtendedHandshakeClientVersion)
+				fmt.Printf("Torrent version prefix: %q\n", version.DefaultBep20Prefix)
+				return nil
+			},
+			Desc: "prints various protocol default version strings",
+		}},
+		bargle.Subcommand{Name: "serve", Command: serve()},
+		bargle.Subcommand{Name: "create", Command: create()},
+		bargle.Subcommand{Name: "lpd", Command: lpdCmd()},
+	)
+	// Well this sux, this old version of bargle doesn't return so we can let the gostdapp Context
+	// clean up.
+	main.Run()
+	return nil
 }

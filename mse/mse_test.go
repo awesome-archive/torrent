@@ -2,16 +2,27 @@ package mse
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/rc4"
 	"io"
-	"io/ioutil"
 	"net"
 	"sync"
 	"testing"
 
-	"github.com/bradfitz/iter"
-	"github.com/stretchr/testify/require"
+	_ "github.com/anacrolix/envpprof"
+	qt "github.com/go-quicktest/qt"
 )
+
+func sliceIter(skeys [][]byte) SecretKeyIter {
+	return func(callback func([]byte) bool) {
+		for _, sk := range skeys {
+			if !callback(sk) {
+				break
+			}
+		}
+	}
+}
 
 func TestReadUntil(t *testing.T) {
 	test := func(data, until string, leftover int, expectedErr error) {
@@ -46,17 +57,15 @@ func TestSuffixMatchLen(t *testing.T) {
 	test("sup", "person", 1)
 }
 
-func handshakeTest(t testing.TB, ia []byte, aData, bData string) {
+func handshakeTest(t testing.TB, ia []byte, aData, bData string, cryptoProvides CryptoMethod, cryptoSelect CryptoSelector) {
 	a, b := net.Pipe()
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		a, err := InitiateHandshake(a, []byte("yep"), ia)
-		if err != nil {
-			t.Fatal(err)
-			return
-		}
+		a, cm, err := InitiateHandshake(a, []byte("yep"), ia, cryptoProvides)
+		qt.Assert(t, qt.IsNil(err))
+		qt.Check(t, qt.Equals(cm, cryptoSelect(cryptoProvides)))
 		go a.Write([]byte(aData))
 
 		var msg [20]byte
@@ -68,16 +77,20 @@ func handshakeTest(t testing.TB, ia []byte, aData, bData string) {
 	}()
 	go func() {
 		defer wg.Done()
-		b, err := ReceiveHandshake(b, [][]byte{[]byte("nope"), []byte("yep"), []byte("maybe")})
-		if err != nil {
-			t.Fatal(err)
-			return
-		}
+		res := ReceiveHandshakeEx(
+			context.Background(),
+			b,
+			sliceIter([][]byte{[]byte("nope"), []byte("yep"), []byte("maybe")}),
+			cryptoSelect,
+		)
+		qt.Assert(t, qt.IsNil(res.error))
+		qt.Check(t, qt.Equals(string(res.SecretKey), "yep"))
+		b := res.ReadWriter
+		qt.Check(t, qt.Equals(res.CryptoMethod, cryptoSelect(cryptoProvides)))
 		go b.Write([]byte(bData))
-		// Need to be exact here, as there are several reads, and net.Pipe is
-		// most synchronous.
+		// Need to be exact here, as there are several reads, and net.Pipe is most synchronous.
 		msg := make([]byte, len(ia)+len(aData))
-		n, _ := io.ReadFull(b, msg[:])
+		n, _ := io.ReadFull(b, msg)
 		if n != len(msg) {
 			t.FailNow()
 		}
@@ -88,20 +101,24 @@ func handshakeTest(t testing.TB, ia []byte, aData, bData string) {
 	b.Close()
 }
 
-func allHandshakeTests(t testing.TB) {
-	handshakeTest(t, []byte("jump the gun, "), "hello world", "yo dawg")
-	handshakeTest(t, nil, "hello world", "yo dawg")
-	handshakeTest(t, []byte{}, "hello world", "yo dawg")
+func allHandshakeTests(t testing.TB, provides CryptoMethod, selector CryptoSelector) {
+	handshakeTest(t, []byte("jump the gun, "), "hello world", "yo dawg", provides, selector)
+	handshakeTest(t, nil, "hello world", "yo dawg", provides, selector)
+	handshakeTest(t, []byte{}, "hello world", "yo dawg", provides, selector)
 }
 
-func TestHandshake(t *testing.T) {
-	allHandshakeTests(t)
+func TestHandshakeDefault(t *testing.T) {
+	allHandshakeTests(t, AllSupportedCrypto, DefaultCryptoSelector)
 	t.Logf("crypto provides encountered: %s", cryptoProvidesCount)
 }
 
-func BenchmarkHandshake(b *testing.B) {
-	for range iter.N(b.N) {
-		allHandshakeTests(b)
+func TestHandshakeSelectPlaintext(t *testing.T) {
+	allHandshakeTests(t, AllSupportedCrypto, func(CryptoMethod) CryptoMethod { return CryptoMethodPlaintext })
+}
+
+func BenchmarkHandshakeDefault(b *testing.B) {
+	for i := 0; i < b.N; i += 1 {
+		allHandshakeTests(b, AllSupportedCrypto, DefaultCryptoSelector)
 	}
 }
 
@@ -118,10 +135,154 @@ func (tr *trackReader) Read(b []byte) (n int, err error) {
 
 func TestReceiveRandomData(t *testing.T) {
 	tr := trackReader{rand.Reader, 0}
-	_, err := ReceiveHandshake(readWriter{&tr, ioutil.Discard}, nil)
+	_, _, err := ReceiveHandshake(context.Background(), readWriter{&tr, io.Discard}, nil, DefaultCryptoSelector)
 	// No skey matches
-	require.Error(t, err)
+	qt.Assert(t, qt.IsNotNil(err))
 	// Establishing S, and then reading the maximum padding for giving up on
 	// synchronizing.
-	require.EqualValues(t, 96+532, tr.n)
+	qt.Assert(t, qt.Equals(tr.n, 96+532))
+}
+
+func fillRand(t testing.TB, bs ...[]byte) {
+	for _, b := range bs {
+		_, err := rand.Read(b)
+		qt.Assert(t, qt.IsNil(err))
+	}
+}
+
+func readAndWrite(rw io.ReadWriter, r, w []byte) error {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var wErr error
+	go func() {
+		defer wg.Done()
+		_, wErr = rw.Write(w)
+	}()
+	_, err := io.ReadFull(rw, r)
+	if err != nil {
+		return err
+	}
+	wg.Wait()
+	return wErr
+}
+
+func benchmarkStream(t *testing.B, crypto CryptoMethod) {
+	ia := make([]byte, 0x1000)
+	a := make([]byte, 1<<20)
+	b := make([]byte, 1<<20)
+	fillRand(t, ia, a, b)
+	t.StopTimer()
+	t.SetBytes(int64(len(ia) + len(a) + len(b)))
+	t.ResetTimer()
+	for i := 0; i < t.N; i += 1 {
+		ac, bc := net.Pipe()
+		ar := make([]byte, len(b))
+		br := make([]byte, len(ia)+len(a))
+		t.StartTimer()
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer ac.Close()
+			defer wg.Done()
+			rw, _, err := InitiateHandshake(ac, []byte("cats"), ia, crypto)
+			qt.Assert(t, qt.IsNil(err))
+			qt.Assert(t, qt.IsNil(readAndWrite(rw, ar, a)))
+		}()
+		func() {
+			defer bc.Close()
+			rw, _, err := ReceiveHandshake(
+				context.Background(),
+				bc,
+				sliceIter([][]byte{[]byte("cats")}),
+				func(CryptoMethod) CryptoMethod { return crypto },
+			)
+			qt.Assert(t, qt.IsNil(err))
+			qt.Assert(t, qt.IsNil(readAndWrite(rw, br, b)))
+		}()
+		wg.Wait()
+		t.StopTimer()
+		if !bytes.Equal(ar, b) {
+			t.Fatalf("A read the wrong bytes")
+		}
+		if !bytes.Equal(br[:len(ia)], ia) {
+			t.Fatalf("B read the wrong IA")
+		}
+		if !bytes.Equal(br[len(ia):], a) {
+			t.Fatalf("B read the wrong A")
+		}
+		// qt.Assert(t, qt.Equals(ar, b))
+		// qt.Assert(t, qt.Equals(br[:len(ia)], ia))
+		// qt.Assert(t, qt.Equals(br[len(ia):], a))
+	}
+}
+
+func BenchmarkStreamRC4(t *testing.B) {
+	benchmarkStream(t, CryptoMethodRC4)
+}
+
+func BenchmarkStreamPlaintext(t *testing.B) {
+	benchmarkStream(t, CryptoMethodPlaintext)
+}
+
+func BenchmarkPipeRC4(t *testing.B) {
+	key := make([]byte, 20)
+	n, _ := rand.Read(key)
+	qt.Assert(t, qt.Equals(n, len(key)))
+	var buf bytes.Buffer
+	c, err := rc4.NewCipher(key)
+	qt.Assert(t, qt.IsNil(err))
+	r := cipherReader{
+		c: c,
+		r: &buf,
+	}
+	c, err = rc4.NewCipher(key)
+	qt.Assert(t, qt.IsNil(err))
+	w := cipherWriter{
+		c: c,
+		w: &buf,
+	}
+	a := make([]byte, 0x1000)
+	n, _ = io.ReadFull(rand.Reader, a)
+	qt.Assert(t, qt.Equals(n, len(a)))
+	b := make([]byte, len(a))
+	t.SetBytes(int64(len(a)))
+	t.ResetTimer()
+	for i := 0; i < t.N; i += 1 {
+		n, _ = w.Write(a)
+		if n != len(a) {
+			t.FailNow()
+		}
+		n, _ = r.Read(b)
+		if n != len(b) {
+			t.FailNow()
+		}
+		if !bytes.Equal(a, b) {
+			t.FailNow()
+		}
+	}
+}
+
+func BenchmarkSkeysReceive(b *testing.B) {
+	var skeys [][]byte
+	for i := 0; i < 100000; i += 1 {
+		skeys = append(skeys, make([]byte, 20))
+	}
+	fillRand(b, skeys...)
+	initSkey := skeys[len(skeys)/2]
+	// c := qt.New(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i += 1 {
+		initiator, receiver := net.Pipe()
+		go func() {
+			_, _, err := InitiateHandshake(initiator, initSkey, nil, AllSupportedCrypto)
+			if err != nil {
+				panic(err)
+			}
+		}()
+		res := ReceiveHandshakeEx(context.Background(), receiver, sliceIter(skeys), DefaultCryptoSelector)
+		if res.error != nil {
+			panic(res.error)
+		}
+	}
 }

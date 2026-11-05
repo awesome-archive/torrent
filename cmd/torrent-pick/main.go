@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	_ "github.com/anacrolix/envpprof"
-	"github.com/anacrolix/missinggo"
 	"github.com/dustin/go-humanize"
 	"github.com/jessevdk/go-flags"
 
@@ -25,16 +23,15 @@ import (
 
 // fmt.Fprintf(os.Stderr, "Usage: %s \n", os.Args[0])
 
-func resolvedPeerAddrs(ss []string) (ret []torrent.Peer, err error) {
+func resolvedPeerAddrs(ss []string) (ret []torrent.PeerInfo, err error) {
 	for _, s := range ss {
 		var addr *net.TCPAddr
 		addr, err = net.ResolveTCPAddr("tcp", s)
 		if err != nil {
 			return
 		}
-		ret = append(ret, torrent.Peer{
-			IP:   addr.IP,
-			Port: addr.Port,
+		ret = append(ret, torrent.PeerInfo{
+			Addr: addr,
 		})
 	}
 	return
@@ -80,10 +77,12 @@ func dstFileName(picked string) string {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	var rootGroup struct {
-		Client    torrent.Config `group:"Client Options"`
-		TestPeers []string       `long:"test-peer" description:"address of peer to inject to every torrent"`
-		Pick      string         `long:"pick" description:"filename to pick"`
+	rootGroup := struct {
+		Client    *torrent.ClientConfig `group:"Client Options"`
+		TestPeers []string              `long:"test-peer" description:"address of peer to inject to every torrent"`
+		Pick      string                `long:"pick" description:"filename to pick"`
+	}{
+		Client: torrent.NewDefaultClientConfig(),
 	}
 	// Don't pass flags.PrintError because it's inconsistent with printing.
 	// https://github.com/jessevdk/go-flags/issues/132
@@ -107,7 +106,7 @@ func main() {
 		return
 	}
 
-	tmpdir, err := ioutil.TempDir("", "torrent-pick-")
+	tmpdir, err := os.MkdirTemp("", "torrent-pick-")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -116,7 +115,7 @@ func main() {
 
 	rootGroup.Client.DataDir = tmpdir
 
-	client, err := torrent.NewClient(&rootGroup.Client)
+	client, err := torrent.NewClient(rootGroup.Client)
 	if err != nil {
 		log.Fatalf("error creating client: %s", err)
 	}
@@ -163,7 +162,9 @@ func main() {
 				if file.DisplayPath() != rootGroup.Pick {
 					continue
 				}
-				srcReader := missinggo.NewSectionReadSeeker(t.NewReader(), file.Offset(), file.Length())
+				file.Download()
+				srcReader := file.NewReader()
+				defer srcReader.Close()
 				io.Copy(dstWriter, srcReader)
 				return
 			}
@@ -172,6 +173,7 @@ func main() {
 	}
 
 	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 waitDone:
 	for {
 		select {

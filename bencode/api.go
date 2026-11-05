@@ -1,11 +1,12 @@
 package bencode
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
 	"reflect"
+
+	"github.com/anacrolix/missinggo/expect"
 )
 
 //----------------------------------------------------------------------------
@@ -32,7 +33,7 @@ func (e *UnmarshalInvalidArgError) Error() string {
 		return "bencode: Unmarshal(nil)"
 	}
 
-	if e.Type.Kind() != reflect.Ptr {
+	if e.Type.Kind() != reflect.Pointer {
 		return "bencode: Unmarshal(non-pointer " + e.Type.String() + ")"
 	}
 	return "bencode: Unmarshal(nil " + e.Type.String() + ")"
@@ -40,13 +41,18 @@ func (e *UnmarshalInvalidArgError) Error() string {
 
 // Unmarshaler spotted a value that was not appropriate for a given Go value.
 type UnmarshalTypeError struct {
-	Value string
-	Type  reflect.Type
+	BencodeTypeName     string
+	UnmarshalTargetType reflect.Type
 }
 
+// This could probably be a value type, but we may already have users assuming
+// that it's passed by pointer.
 func (e *UnmarshalTypeError) Error() string {
-	return "bencode: value (" + e.Value + ") is not appropriate for type: " +
-		e.Type.String()
+	return fmt.Sprintf(
+		"can't unmarshal a bencode %v into a %v",
+		e.BencodeTypeName,
+		e.UnmarshalTargetType,
+	)
 }
 
 // Unmarshaler tried to write to an unexported (therefore unwritable) field.
@@ -109,11 +115,11 @@ type Unmarshaler interface {
 	UnmarshalBencode([]byte) error
 }
 
-// Marshal the value 'v' to the bencode form, return the result as []byte and an
-// error if any.
+// Marshal the value 'v' to the bencode form, return the result as []byte and
+// an error if any.
 func Marshal(v interface{}) ([]byte, error) {
 	var buf bytes.Buffer
-	e := Encoder{w: bufio.NewWriter(&buf)}
+	e := Encoder{w: &buf}
 	err := e.Encode(v)
 	if err != nil {
 		return nil, err
@@ -121,17 +127,41 @@ func Marshal(v interface{}) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// Unmarshal the bencode value in the 'data' to a value pointed by the 'v'
-// pointer, return a non-nil error if any.
-func Unmarshal(data []byte, v interface{}) error {
-	e := Decoder{r: bytes.NewBuffer(data)}
-	return e.Decode(v)
+func MustMarshal(v interface{}) []byte {
+	b, err := Marshal(v)
+	expect.Nil(err)
+	return b
+}
+
+// Unmarshal the bencode value in the 'data' to a value pointed by the 'v' pointer, return a non-nil
+// error if any. If there are trailing bytes, this results in ErrUnusedTrailingBytes, but the value
+// will be valid. It's probably more consistent to use Decoder.Decode if you want to rely on this
+// behaviour (inspired by Rust's serde here).
+func Unmarshal(data []byte, v interface{}) (err error) {
+	buf := bytes.NewReader(data)
+	dec := Decoder{r: buf}
+	err = dec.Decode(v)
+	if err != nil {
+		return
+	}
+	if buf.Len() != 0 {
+		return ErrUnusedTrailingBytes{buf.Len()}
+	}
+	return dec.ReadEOF()
+}
+
+type ErrUnusedTrailingBytes struct {
+	NumUnusedBytes int
+}
+
+func (me ErrUnusedTrailingBytes) Error() string {
+	return fmt.Sprintf("%d unused trailing bytes", me.NumUnusedBytes)
 }
 
 func NewDecoder(r io.Reader) *Decoder {
-	return &Decoder{r: bufio.NewReader(r)}
+	return &Decoder{r: &scanner{r: r}}
 }
 
 func NewEncoder(w io.Writer) *Encoder {
-	return &Encoder{w: bufio.NewWriter(w)}
+	return &Encoder{w: w}
 }

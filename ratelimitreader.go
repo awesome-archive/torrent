@@ -1,12 +1,23 @@
 package torrent
 
 import (
-	"context"
 	"io"
 	"time"
 
+	"github.com/anacrolix/missinggo/v2/panicif"
 	"golang.org/x/time/rate"
 )
+
+func newRateLimitedReader(r io.Reader, l *rate.Limiter) io.Reader {
+	if l == nil {
+		// Avoids taking Limiter lock to check limit, and allows type assertions to bypass Read.
+		return r
+	}
+	return rateLimitedReader{
+		l: l,
+		r: r,
+	}
+}
 
 type rateLimitedReader struct {
 	l *rate.Limiter
@@ -14,12 +25,18 @@ type rateLimitedReader struct {
 }
 
 func (me rateLimitedReader) Read(b []byte) (n int, err error) {
-	if err := me.l.WaitN(context.Background(), 1); err != nil {
-		panic(err)
+	// Avoid truncating the read if everything is permitted anyway.
+	if me.l.Limit() == rate.Inf {
+		return me.r.Read(b)
+	}
+	// If the burst is zero, let the limiter method handle errors.
+	if me.l.Burst() != 0 {
+		b = b[:min(len(b), me.l.Burst())]
 	}
 	n, err = me.r.Read(b)
-	if !me.l.ReserveN(time.Now(), n-1).OK() {
-		panic(n - 1)
-	}
+	// golang.org/x/time/rate is completely fucking busted. TODO: Write my own rate limiter.
+	r := me.l.ReserveN(time.Now(), n)
+	panicif.False(r.OK())
+	time.Sleep(r.Delay())
 	return
 }
